@@ -1,0 +1,129 @@
+name: Build binaries
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NAME: esp-idf-nvs-partition-gen
+
+jobs:
+  build:
+    name: Build binaries for ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-amd64, linux-amd64, macos-amd64, macos-arm64, linux-armv7, linux-aarch64]
+        include:
+          - platform: windows-amd64
+            runner: windows-latest
+          - platform: linux-amd64
+            runner: ubuntu-latest
+          - platform: macos-amd64
+            runner: macos-15-intel
+          - platform: macos-arm64
+            runner: macos-latest
+          - platform: linux-armv7
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      DISTPATH: esp-idf-nvs-partition-gen-${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        if: matrix.platform != 'linux-armv7'
+        with:
+          python-version: '3.13'
+
+      - name: Build with PyInstaller
+        uses: espressif/python-binary-action@master
+        with:
+          scripts: esp_idf_nvs_partition_gen/nvs_partition_gen.py
+          script-name: ${{ env.NAME }}
+          output-dir: ./${{ env.DISTPATH }}
+          target-platform: ${{ matrix.platform }}
+          icon-file: ${{ matrix.platform == 'windows-amd64' && 'ci/espressif.ico' || '' }}
+          # Recommended by python-binary-action for rich>=14.3, which loads Unicode data via dynamic imports
+          additional-args: --collect-submodules=rich._unicode_data
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-keyvault-uri: ${{ secrets.AZURE_KEYVAULT_URI }}
+          azure-keyvault-cert-name: ${{ secrets.AZURE_KEYVAULT_CERT_NAME }}
+          macos-signing-identity: ${{ secrets.MACOS_CS_IDENTITY_ID }}
+          macos-certificate: ${{ secrets.MACOS_CS_CERTIFICATE }}
+          macos-certificate-pwd: ${{ secrets.MACOS_CS_CERTIFICATE_PWD }}
+
+      - name: Add license and readme
+        shell: bash
+        run: cp LICENSE README.md ./${{ env.DISTPATH }}
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.DISTPATH }}
+          path: ${{ env.DISTPATH }}
+
+  # The repository has no release tags; PyPI releases are triggered by a version bump on main
+  # (release_pypi.yml). Mirror that here: create a draft GitHub release once per new version.
+  create_release:
+    name: Create GitHub release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'espressif'
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Get version
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=$(python -c "from esp_idf_nvs_partition_gen import __version__; print(__version__)")
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+          if gh release view "v${VERSION}" > /dev/null 2>&1; then
+            echo "Release v${VERSION} already exists, skipping"
+            echo "EXISTS=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download built binaries
+        if: steps.get_version.outputs.EXISTS != 'true'
+        uses: actions/download-artifact@v8
+
+      - name: Compress and rename binaries
+        if: steps.get_version.outputs.EXISTS != 'true'
+        shell: bash
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          for dir in "${NAME}"-*/; do
+            dir=${dir%/}
+            platform=${dir#"${NAME}-"}
+            if [[ "$platform" == windows-* ]]; then
+              zip -r "${NAME}-v${VERSION}-${platform}.zip" "$dir"
+            else
+              chmod -R u=rwx,g=rx,o=rx "$dir"
+              tar -czf "${NAME}-v${VERSION}-${platform}.tar.gz" "$dir"
+            fi
+          done
+
+      - name: Create draft release
+        if: steps.get_version.outputs.EXISTS != 'true'
+        shell: bash
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          gh release create "v${VERSION}" \
+            --draft \
+            --target "${GITHUB_SHA}" \
+            --title "Version ${VERSION}" \
+            --notes "Standalone executables of ${NAME} v${VERSION}. The Python package is available on [PyPI](https://pypi.org/project/${NAME}/${VERSION}/)." \
+            "${NAME}-v${VERSION}"-*.zip "${NAME}-v${VERSION}"-*.tar.gz
